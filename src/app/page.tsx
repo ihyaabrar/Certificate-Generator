@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { loadProjects, deleteProject, upsertProject } from '@/src/lib/storage';
-import { generateId, formatDate } from '@/src/lib/utils';
+import { loadProjects, deleteProject, upsertProject, duplicateProject, exportAllData, importAllData } from '@/src/lib/storage';
+import { generateId, formatDate, downloadText } from '@/src/lib/utils';
 import type { Project } from '@/src/types';
 
 export default function Dashboard() {
@@ -14,6 +14,8 @@ export default function Dashboard() {
   const [newName, setNewName] = useState('');
   const [nameError, setNameError] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+  const [importMsg, setImportMsg] = useState('');
+  const importRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setProjects(loadProjects());
@@ -42,6 +44,13 @@ export default function Dashboard() {
       signer2Name: '',
       signer2Title: '',
       signer2SignatureURL: '',
+      numberingConfig: {
+        mode: 'auto',
+        prefix: '',
+        suffix: String(new Date().getFullYear()),
+        startFrom: 1,
+        digits: 3,
+      },
       recipients: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -56,6 +65,36 @@ export default function Dashboard() {
     setProjects(loadProjects());
   }
 
+  function handleDuplicate(id: string) {
+    const copy = duplicateProject(id);
+    if (copy) {
+      setProjects(loadProjects());
+    }
+  }
+
+  function handleExportBackup() {
+    const data = exportAllData();
+    downloadText(data, `certgen-backup-${Date.now()}.json`, 'application/json');
+  }
+
+  function handleImportBackup(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const result = importAllData(ev.target?.result as string);
+      if (result.success) {
+        setImportMsg(`✓ ${result.count} proyek berhasil diimpor`);
+        setProjects(loadProjects());
+      } else {
+        setImportMsg(`✗ Gagal: ${result.error}`);
+      }
+      setTimeout(() => setImportMsg(''), 4000);
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
   return (
     <div className="min-h-screen bg-white">
       {/* Navbar */}
@@ -67,14 +106,34 @@ export default function Dashboard() {
             </div>
             <span className="font-bold text-gray-900 text-lg">CertGen</span>
           </div>
-          <button
-            onClick={() => { setShowNew(true); setNewName(''); setNameError(''); }}
-            className="bg-emerald-500 hover:bg-emerald-600 text-white px-4 py-2 rounded-full text-sm font-semibold transition-all shadow-sm hover:shadow-md flex items-center gap-1.5"
-          >
-            <span className="text-base leading-none">+</span>
-            <span className="hidden sm:inline">Proyek Baru</span>
-            <span className="sm:hidden">Baru</span>
-          </button>
+          <div className="flex items-center gap-2">
+            {importMsg && (
+              <span className={`text-xs px-3 py-1 rounded-full hidden sm:block ${importMsg.startsWith('✓') ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                {importMsg}
+              </span>
+            )}
+            <button onClick={handleExportBackup} title="Backup semua proyek ke file JSON"
+              className="text-gray-400 hover:text-emerald-600 transition-colors p-2 rounded-lg hover:bg-emerald-50">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+            </button>
+            <button onClick={() => importRef.current?.click()} title="Restore dari backup JSON"
+              className="text-gray-400 hover:text-emerald-600 transition-colors p-2 rounded-lg hover:bg-emerald-50">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            </button>
+            <input ref={importRef} type="file" accept=".json" className="hidden" onChange={handleImportBackup} />
+            <button
+              onClick={() => { setShowNew(true); setNewName(''); setNameError(''); }}
+              className="bg-emerald-500 hover:bg-emerald-600 text-white px-4 py-2 rounded-full text-sm font-semibold transition-all shadow-sm hover:shadow-md flex items-center gap-1.5"
+            >
+              <span className="text-base leading-none">+</span>
+              <span className="hidden sm:inline">Proyek Baru</span>
+              <span className="sm:hidden">Baru</span>
+            </button>
+          </div>
         </div>
       </nav>
 
@@ -243,13 +302,22 @@ export default function Dashboard() {
                       <Link
                         href={`/projects/${p.id}/print`}
                         className="border border-emerald-200 text-emerald-600 hover:bg-emerald-50 px-3 py-2 rounded-xl text-xs font-semibold transition-all"
+                        title="Cetak sertifikat"
                       >
                         🖨️
                       </Link>
                     )}
                     <button
+                      onClick={() => handleDuplicate(p.id)}
+                      className="border border-gray-200 text-gray-400 hover:bg-gray-50 px-3 py-2 rounded-xl text-xs transition-all"
+                      title="Duplikasi proyek"
+                    >
+                      📋
+                    </button>
+                    <button
                       onClick={() => handleDelete(p.id, p.name)}
                       className="border border-red-100 text-red-400 hover:bg-red-50 px-3 py-2 rounded-xl text-xs transition-all"
+                      title="Hapus proyek"
                     >
                       🗑️
                     </button>

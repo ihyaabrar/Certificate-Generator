@@ -39,3 +39,38 @@ export function deleteProject(id: string): void {
   const projects = loadProjects().filter((p) => p.id !== id);
   saveProjects(projects);
 }
+
+export function duplicateProject(id: string): Project | null {
+  const original = getProject(id);
+  if (!original) return null;
+  const copy: Project = {
+    ...original,
+    id: crypto.randomUUID(),
+    name: `${original.name} (Salinan)`,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  upsertProject(copy);
+  return copy;
+}
+
+// ─── Backup / Restore ─────────────────────────────────────────────────────────
+
+export function exportAllData(): string {
+  const projects = loadProjects();
+  return JSON.stringify({ version: 1, exportedAt: Date.now(), projects }, null, 2);
+}
+
+export function importAllData(json: string): { success: boolean; count: number; error?: string } {
+  try {
+    const data = JSON.parse(json) as { version: number; projects: Project[] };
+    if (!Array.isArray(data.projects)) throw new Error('Format tidak valid');
+    const existing = loadProjects();
+    const existingIds = new Set(existing.map(p => p.id));
+    const toImport = data.projects.filter(p => !existingIds.has(p.id));
+    saveProjects([...toImport, ...existing]);
+    return { success: true, count: toImport.length };
+  } catch (e) {
+    return { success: false, count: 0, error: e instanceof Error ? e.message : 'Error tidak diketahui' };
+  }
+}

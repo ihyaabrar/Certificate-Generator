@@ -47,7 +47,7 @@ export default function PrintPage() {
 
   const recipients = project.recipients.length > 0
     ? project.recipients
-    : [{ id: 'preview', name: 'Nama Penerima', certificateNumber: '001' }];
+    : [{ id: 'preview', name: 'Nama Penerima', certificateNumber: '001', customFields: {} }];
 
   return (
     <div className="min-h-screen bg-white">

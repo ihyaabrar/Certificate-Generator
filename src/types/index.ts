@@ -45,16 +45,6 @@ export interface TemplateDefinition {
   tags: string[];
 }
 
-export interface TemplateDefinition {
-  id: TemplateId;
-  name: string;
-  description: string;
-  previewBg: string;       // Tailwind bg class for card preview
-  accentColor: string;     // hex color for accents
-  fontTitle: string;       // font family for title
-  fontBody: string;        // font family for body
-}
-
 // ─── Certificate Data ─────────────────────────────────────────────────────────
 
 export interface CertificateData {
@@ -74,6 +64,18 @@ export interface CertificateData {
   signer2SignatureURL?: string;
 }
 
+// ─── Numbering Config ─────────────────────────────────────────────────────────
+
+export type NumberingMode = 'auto' | 'custom';
+
+export interface NumberingConfig {
+  mode: NumberingMode;
+  prefix: string;       // e.g. "SK/WORKSHOP"
+  suffix: string;       // e.g. "/2026"
+  startFrom: number;    // e.g. 1
+  digits: number;       // e.g. 3 → "001"
+}
+
 // ─── Project ──────────────────────────────────────────────────────────────────
 
 export interface Project {
@@ -85,13 +87,16 @@ export interface Project {
   organizer: string;
   date: string;
   location: string;
-  logoDataURL: string;       // base64 logo organisasi
+  logoDataURL: string;
   signer1Name: string;
   signer1Title: string;
-  signer1SignatureURL: string; // base64 gambar TTD 1
+  signer1SignatureURL: string;
   signer2Name: string;
   signer2Title: string;
-  signer2SignatureURL: string; // base64 gambar TTD 2
+  signer2SignatureURL: string;
+  numberingConfig: NumberingConfig;
+  qrEnabled?: boolean;
+  watermarkText?: string;
   recipients: Recipient[];
   createdAt: number;
   updatedAt: number;
@@ -100,5 +105,6 @@ export interface Project {
 export interface Recipient {
   id: string;
   name: string;
+  customFields: Record<string, string>; // extra data from Excel columns
   certificateNumber: string;
 }

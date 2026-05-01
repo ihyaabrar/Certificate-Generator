@@ -4,7 +4,16 @@ import { useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { getProject, upsertProject } from '@/src/lib/storage';
-import { generateId, formatDate, padNumber } from '@/src/lib/utils';
+import {
+  generateId,
+  formatDate,
+  generateCertNumber,
+  regenerateCertNumbers,
+  exportRecipientsToCSV,
+  downloadText,
+  parseExcelFile,
+  parseCSVFile,
+} from '@/src/lib/utils';
 import {
   TEMPLATE_CATEGORIES,
   getTemplatesByCategory,
@@ -18,6 +27,8 @@ import type {
   CertificateData,
   TemplateDefinition,
   TemplateCategory,
+  NumberingConfig,
+  NumberingMode,
 } from '@/src/types';
 import {
   ChevronLeft,
@@ -35,7 +46,18 @@ import {
   Palette,
   ClipboardList,
   ArrowRight,
+  Download,
 } from '@/src/components/ui/Icons';
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const DEFAULT_NUMBERING: NumberingConfig = {
+  mode: 'auto',
+  prefix: '',
+  suffix: String(new Date().getFullYear()),
+  startFrom: 1,
+  digits: 3,
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -67,11 +89,17 @@ function buildCertData(project: Project, recipient: Recipient): CertificateData 
   };
 }
 
+function certNumberPreview(config: NumberingConfig): string {
+  const examples = [0, 1, 2].map((i) => generateCertNumber(config, i));
+  return examples.join(', ') + '...';
+}
+
 // ─── Step Indicator ───────────────────────────────────────────────────────────
 
 const STEPS = [
   { label: 'Template', icon: <Palette size={14} /> },
   { label: 'Info Kegiatan', icon: <ClipboardList size={14} /> },
+  { label: 'Pengaturan', icon: <Check size={14} /> },
   { label: 'Penerima', icon: <Users size={14} /> },
   { label: 'Preview', icon: <Eye size={14} /> },
 ];
@@ -90,7 +118,6 @@ function StepIndicator({
         const current = i === active;
         return (
           <div key={i} className="flex items-start flex-1 min-w-0">
-            {/* Step node */}
             <div className="flex flex-col items-center flex-shrink-0">
               <button
                 onClick={() => onChange(i)}
@@ -105,15 +132,46 @@ function StepIndicator({
                 {step.label}
               </span>
             </div>
-            {/* Connector line */}
             {i < STEPS.length - 1 && (
-              <div className="flex-1 h-[2px] mt-4 mx-1 rounded-full transition-all"
+              <div
+                className="flex-1 h-[2px] mt-4 mx-1 rounded-full transition-all"
                 style={{ background: i < active ? '#10b981' : '#e5e7eb' }}
               />
             )}
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────────────
+
+interface ToastItem {
+  id: string;
+  message: string;
+  type: 'success' | 'info' | 'undo';
+  onUndo?: () => void;
+}
+
+function Toast({ toast, onDismiss }: { toast: ToastItem; onDismiss: (id: string) => void }) {
+  return (
+    <div
+      className={`flex items-center gap-3 px-4 py-3 rounded-xl shadow-lg text-sm font-medium text-white animate-fade-in
+        ${toast.type === 'success' ? 'bg-emerald-500' : toast.type === 'undo' ? 'bg-gray-800' : 'bg-blue-500'}`}
+    >
+      <span className="flex-1">{toast.message}</span>
+      {toast.onUndo && (
+        <button
+          onClick={() => { toast.onUndo?.(); onDismiss(toast.id); }}
+          className="underline text-white/90 hover:text-white text-xs font-semibold"
+        >
+          Batalkan
+        </button>
+      )}
+      <button onClick={() => onDismiss(toast.id)} className="text-white/70 hover:text-white">
+        <X size={14} />
+      </button>
     </div>
   );
 }
@@ -141,18 +199,41 @@ export default function ProjectPage() {
   const [bulkMode, setBulkMode] = useState(false);
   const [singleInput, setSingleInput] = useState('');
   const [bulkText, setBulkText] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [lastDeleted, setLastDeleted] = useState<{ recipient: Recipient; index: number } | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Toast state
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   // Preview tab state
   const [previewIndex, setPreviewIndex] = useState(0);
+
+  function showToast(message: string, type: ToastItem['type'] = 'success', onUndo?: () => void) {
+    const toastId = generateId();
+    setToasts((prev) => [...prev, { id: toastId, message, type, onUndo }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== toastId));
+    }, 5000);
+  }
+
+  function dismissToast(id: string) {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }
 
   // Load project
   useEffect(() => {
     if (!id) return;
     const p = getProject(id);
     if (p) {
-      setProject(p);
+      // Backfill missing fields for old data
+      const patched: Project = {
+        ...p,
+        numberingConfig: p.numberingConfig ?? DEFAULT_NUMBERING,
+      };
+      setProject(patched);
     } else {
-      // New project defaults
       const newProject: Project = {
         id,
         name: 'Proyek Baru',
@@ -169,6 +250,7 @@ export default function ProjectPage() {
         signer2Name: '',
         signer2Title: '',
         signer2SignatureURL: '',
+        numberingConfig: DEFAULT_NUMBERING,
         recipients: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -250,6 +332,15 @@ export default function ProjectPage() {
           />
         )}
         {tab === 2 && (
+          <SettingsTab
+            project={project}
+            onSave={save}
+            onNext={() => setTab(3)}
+            onBack={() => setTab(1)}
+            showToast={showToast}
+          />
+        )}
+        {tab === 3 && (
           <RecipientsTab
             project={project}
             onSave={save}
@@ -259,19 +350,36 @@ export default function ProjectPage() {
             setSingleInput={setSingleInput}
             bulkText={bulkText}
             setBulkText={setBulkText}
-            onNext={() => setTab(3)}
-            onBack={() => setTab(1)}
+            searchQuery={searchQuery}
+            setSearchQuery={setSearchQuery}
+            selectedIds={selectedIds}
+            setSelectedIds={setSelectedIds}
+            lastDeleted={lastDeleted}
+            setLastDeleted={setLastDeleted}
+            undoTimerRef={undoTimerRef}
+            onNext={() => setTab(4)}
+            onBack={() => setTab(2)}
+            showToast={showToast}
           />
         )}
-        {tab === 3 && (
+        {tab === 4 && (
           <PreviewTab
             project={project}
             previewIndex={previewIndex}
             setPreviewIndex={setPreviewIndex}
-            onBack={() => setTab(2)}
+            onBack={() => setTab(3)}
           />
         )}
       </main>
+
+      {/* Toast container */}
+      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 w-full max-w-sm px-4 pointer-events-none">
+        {toasts.map((t) => (
+          <div key={t.id} className="pointer-events-auto">
+            <Toast toast={t} onDismiss={dismissToast} />
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -348,7 +456,6 @@ function TemplateTab({
               className={`bg-white rounded-2xl shadow-sm overflow-hidden border-2 transition cursor-pointer
                 ${selected ? 'border-emerald-500' : 'border-transparent hover:border-emerald-200'}`}
             >
-              {/* Thumbnail */}
               <div
                 className={`relative h-28 ${tpl.previewBg} flex items-center justify-center group`}
                 onClick={() => setPreviewTemplate(tpl)}
@@ -356,19 +463,16 @@ function TemplateTab({
                 <span className="text-xs font-semibold opacity-40 text-gray-700 px-2 text-center leading-tight">
                   {tpl.name}
                 </span>
-                {/* Hover overlay */}
                 <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex flex-col items-center justify-center gap-1">
                   <Eye size={20} className="text-white" />
                   <span className="text-white text-xs font-medium">Preview</span>
                 </div>
-                {/* Selected badge */}
                 {selected && (
                   <div className="absolute top-2 right-2 w-6 h-6 bg-emerald-500 rounded-full flex items-center justify-center">
                     <Check size={12} strokeWidth={3} className="text-white" />
                   </div>
                 )}
               </div>
-              {/* Info */}
               <div className="p-2.5">
                 <p className="text-xs font-semibold text-gray-800 truncate">{tpl.name}</p>
                 <p className="text-[10px] text-gray-400 truncate mt-0.5">{tpl.description}</p>
@@ -437,7 +541,6 @@ function TemplatePreviewModal({
         className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Modal header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <div>
             <h3 className="font-semibold text-gray-800">{template.name}</h3>
@@ -450,13 +553,11 @@ function TemplatePreviewModal({
             <X size={18} />
           </button>
         </div>
-        {/* Certificate preview */}
         <div className="bg-gray-100 p-4 flex items-start justify-center overflow-auto">
           <div style={{ width: 1122 * 0.58, height: 794 * 0.58, position: 'relative', flexShrink: 0 }}>
             <CertificateRenderer templateId={template.id as TemplateId} data={data} scale={0.58} />
           </div>
         </div>
-        {/* Modal footer */}
         <div className="px-5 py-4 border-t border-gray-100 flex justify-end gap-3">
           <button
             onClick={onClose}
@@ -470,13 +571,9 @@ function TemplatePreviewModal({
               ${selected ? 'bg-gray-200 text-gray-600' : 'bg-emerald-500 hover:bg-emerald-600 text-white'}`}
           >
             {selected ? (
-              <>
-                <Check size={15} strokeWidth={3} /> Sudah Dipilih
-              </>
+              <><Check size={15} strokeWidth={3} /> Sudah Dipilih</>
             ) : (
-              <>
-                <Check size={15} strokeWidth={3} /> Pilih Template Ini
-              </>
+              <><Check size={15} strokeWidth={3} /> Pilih Template Ini</>
             )}
           </button>
         </div>
@@ -526,7 +623,6 @@ function InfoTab({
           Informasi Kegiatan
         </h2>
 
-        {/* Nama Kegiatan */}
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1.5">
             Nama Kegiatan <span className="text-red-400">*</span>
@@ -539,7 +635,6 @@ function InfoTab({
           />
         </div>
 
-        {/* Jenis Sertifikat */}
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1.5">
             Jenis Sertifikat
@@ -560,11 +655,8 @@ function InfoTab({
           </div>
         </div>
 
-        {/* Penyelenggara */}
         <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1.5">
-            Penyelenggara
-          </label>
+          <label className="block text-xs font-medium text-gray-600 mb-1.5">Penyelenggara</label>
           <input
             className={inputCls}
             placeholder="Nama organisasi / institusi"
@@ -573,11 +665,8 @@ function InfoTab({
           />
         </div>
 
-        {/* Tanggal */}
         <div>
-          <label className="block text-xs font-medium text-gray-600 mb-1.5">
-            Tanggal
-          </label>
+          <label className="block text-xs font-medium text-gray-600 mb-1.5">Tanggal</label>
           <input
             className={inputCls}
             placeholder="Contoh: 15 Januari 2024"
@@ -586,7 +675,6 @@ function InfoTab({
           />
         </div>
 
-        {/* Lokasi */}
         <div>
           <label className="block text-xs font-medium text-gray-600 mb-1.5">
             Lokasi <span className="text-gray-400 font-normal">(opsional)</span>
@@ -652,7 +740,6 @@ function InfoTab({
           Penandatangan
         </h2>
 
-        {/* Signer 1 */}
         <SignerSection
           label="Penandatangan 1"
           name={project.signer1Name}
@@ -667,7 +754,6 @@ function InfoTab({
 
         <div className="border-t border-gray-100" />
 
-        {/* Signer 2 */}
         <SignerSection
           label="Penandatangan 2 (opsional)"
           name={project.signer2Name}
@@ -693,7 +779,7 @@ function InfoTab({
           onClick={onNext}
           className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium px-5 py-2.5 rounded-xl transition"
         >
-          Lanjut ke Penerima <ArrowRight size={16} />
+          Lanjut ke Pengaturan <ArrowRight size={16} />
         </button>
       </div>
     </div>
@@ -745,7 +831,6 @@ function SignerSection({
         </div>
       </div>
 
-      {/* Signature upload */}
       <div>
         <label className="block text-xs font-medium text-gray-600 mb-1.5">
           Gambar Tanda Tangan
@@ -793,7 +878,247 @@ function SignerSection({
   );
 }
 
-// ─── Tab 3: Penerima ──────────────────────────────────────────────────────────
+// ─── Tab 3: Pengaturan ────────────────────────────────────────────────────────
+
+function SettingsTab({
+  project,
+  onSave,
+  onNext,
+  onBack,
+  showToast,
+}: {
+  project: Project;
+  onSave: (p: Project) => void;
+  onNext: () => void;
+  onBack: () => void;
+  showToast: (msg: string, type?: ToastItem['type']) => void;
+}) {
+  const cfg = project.numberingConfig ?? DEFAULT_NUMBERING;
+
+  function updateCfg(patch: Partial<NumberingConfig>) {
+    onSave({ ...project, numberingConfig: { ...cfg, ...patch } });
+  }
+
+  function applyToAll() {
+    const updated = regenerateCertNumbers(project.recipients, cfg);
+    onSave({ ...project, recipients: updated });
+    showToast(`Nomor sertifikat diperbarui untuk ${updated.length} penerima`, 'success');
+  }
+
+  const preview = certNumberPreview(cfg);
+
+  return (
+    <div className="space-y-5">
+      {/* Nomor Sertifikat */}
+      <div className="bg-white rounded-2xl shadow-sm p-5 space-y-4">
+        <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+          {/* Hash icon via inline SVG */}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-500">
+            <line x1="4" y1="9" x2="20" y2="9" /><line x1="4" y1="15" x2="20" y2="15" />
+            <line x1="10" y1="3" x2="8" y2="21" /><line x1="16" y1="3" x2="14" y2="21" />
+          </svg>
+          Nomor Sertifikat
+        </h2>
+
+        {/* Mode toggle */}
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-2">Mode Penomoran</label>
+          <div className="flex bg-gray-100 rounded-xl p-1 gap-1 w-fit">
+            {(['auto', 'custom'] as NumberingMode[]).map((m) => (
+              <button
+                key={m}
+                onClick={() => updateCfg({ mode: m })}
+                className={`px-4 py-1.5 text-xs font-medium rounded-lg transition
+                  ${cfg.mode === m ? 'bg-white text-emerald-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                {m === 'auto' ? 'Otomatis' : 'Kustom'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {cfg.mode === 'auto' ? (
+          <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-4">
+            <p className="text-xs text-emerald-700 font-medium mb-1">Mode Otomatis</p>
+            <p className="text-xs text-emerald-600">
+              Nomor sertifikat akan dibuat otomatis secara berurutan.
+            </p>
+            <p className="text-xs text-gray-500 mt-2">
+              Contoh: <span className="font-mono font-semibold text-gray-700">{preview}</span>
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1.5">
+                  Prefix <span className="text-gray-400 font-normal">(opsional)</span>
+                </label>
+                <input
+                  className={inputCls}
+                  placeholder="Contoh: SK/WORKSHOP"
+                  value={cfg.prefix}
+                  onChange={(e) => updateCfg({ prefix: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1.5">
+                  Suffix <span className="text-gray-400 font-normal">(opsional)</span>
+                </label>
+                <input
+                  className={inputCls}
+                  placeholder="Contoh: 2026"
+                  value={cfg.suffix}
+                  onChange={(e) => updateCfg({ suffix: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1.5">Mulai dari</label>
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={cfg.startFrom}
+                  onChange={(e) => updateCfg({ startFrom: Math.max(1, Number(e.target.value)) })}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1.5">
+                  Jumlah digit (3–5)
+                </label>
+                <input
+                  type="number"
+                  min={3}
+                  max={5}
+                  className={inputCls}
+                  value={cfg.digits}
+                  onChange={(e) => updateCfg({ digits: Math.min(5, Math.max(3, Number(e.target.value))) })}
+                />
+              </div>
+            </div>
+
+            {/* Live preview */}
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-3">
+              <p className="text-xs text-gray-500 mb-1">Contoh hasil:</p>
+              <p className="font-mono text-sm font-semibold text-gray-800">{preview}</p>
+            </div>
+          </div>
+        )}
+
+        {project.recipients.length > 0 && (
+          <button
+            onClick={applyToAll}
+            className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium px-4 py-2.5 rounded-xl transition"
+          >
+            <Check size={15} strokeWidth={3} />
+            Terapkan ke semua penerima ({project.recipients.length})
+          </button>
+        )}
+      </div>
+
+      {/* QR Code */}
+      <div className="bg-white rounded-2xl shadow-sm p-5 space-y-3">
+        <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+          {/* QR icon */}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-500">
+            <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" /><path d="M14 14h3v3h-3zM17 17h3v3h-3zM14 20h3" />
+          </svg>
+          QR Code
+        </h2>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm text-gray-700 font-medium">Aktifkan QR Code</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              QR code akan muncul di pojok sertifikat berisi nomor sertifikat
+            </p>
+          </div>
+          <button
+            onClick={() => onSave({ ...project, qrEnabled: !project.qrEnabled })}
+            className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0
+              ${project.qrEnabled ? 'bg-emerald-500' : 'bg-gray-200'}`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform
+                ${project.qrEnabled ? 'translate-x-5' : 'translate-x-0'}`}
+            />
+          </button>
+        </div>
+      </div>
+
+      {/* Watermark */}
+      <div className="bg-white rounded-2xl shadow-sm p-5 space-y-3">
+        <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+          {/* Layers icon */}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-500">
+            <polygon points="12 2 2 7 12 12 22 7 12 2" />
+            <polyline points="2 17 12 22 22 17" />
+            <polyline points="2 12 12 17 22 12" />
+          </svg>
+          Watermark
+        </h2>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm text-gray-700 font-medium">Aktifkan Watermark</p>
+            <p className="text-xs text-gray-400 mt-0.5">Teks watermark diagonal di atas sertifikat</p>
+          </div>
+          <button
+            onClick={() =>
+              onSave({
+                ...project,
+                watermarkText: project.watermarkText !== undefined
+                  ? undefined
+                  : 'DRAFT',
+              })
+            }
+            className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0
+              ${project.watermarkText !== undefined ? 'bg-emerald-500' : 'bg-gray-200'}`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform
+                ${project.watermarkText !== undefined ? 'translate-x-5' : 'translate-x-0'}`}
+            />
+          </button>
+        </div>
+        {project.watermarkText !== undefined && (
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1.5">Teks Watermark</label>
+            <input
+              className={inputCls}
+              placeholder="DRAFT"
+              value={project.watermarkText}
+              onChange={(e) => onSave({ ...project, watermarkText: e.target.value })}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Navigation */}
+      <div className="flex justify-between">
+        <button
+          onClick={onBack}
+          className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-700 px-4 py-2.5 rounded-xl hover:bg-gray-100 transition"
+        >
+          <ChevronLeft size={16} /> Kembali
+        </button>
+        <button
+          onClick={onNext}
+          className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium px-5 py-2.5 rounded-xl transition"
+        >
+          Lanjut ke Penerima <ArrowRight size={16} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab 4: Penerima ──────────────────────────────────────────────────────────
+
+interface ImportPreview {
+  rows: { name: string; customFields: Record<string, string> }[];
+  nameColumn: string;
+  extraColumns: string[];
+}
 
 function RecipientsTab({
   project,
@@ -804,8 +1129,16 @@ function RecipientsTab({
   setSingleInput,
   bulkText,
   setBulkText,
+  searchQuery,
+  setSearchQuery,
+  selectedIds,
+  setSelectedIds,
+  lastDeleted,
+  setLastDeleted,
+  undoTimerRef,
   onNext,
   onBack,
+  showToast,
 }: {
   project: Project;
   onSave: (p: Project) => void;
@@ -815,17 +1148,32 @@ function RecipientsTab({
   setSingleInput: (v: string) => void;
   bulkText: string;
   setBulkText: (v: string) => void;
+  searchQuery: string;
+  setSearchQuery: (v: string) => void;
+  selectedIds: Set<string>;
+  setSelectedIds: (v: Set<string>) => void;
+  lastDeleted: { recipient: Recipient; index: number } | null;
+  setLastDeleted: (v: { recipient: Recipient; index: number } | null) => void;
+  undoTimerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
   onNext: () => void;
   onBack: () => void;
+  showToast: (msg: string, type?: ToastItem['type'], onUndo?: () => void) => void;
 }) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
+  const [importing, setImporting] = useState(false);
+
+  const cfg = project.numberingConfig ?? DEFAULT_NUMBERING;
+
   function addSingle() {
     const name = singleInput.trim();
     if (!name) return;
-    const idx = project.recipients.length + 1;
+    const idx = project.recipients.length;
     const recipient: Recipient = {
       id: generateId(),
       name,
-      certificateNumber: `CERT/${padNumber(idx, 3)}/${new Date().getFullYear()}`,
+      customFields: {},
+      certificateNumber: generateCertNumber(cfg, idx),
     };
     onSave({ ...project, recipients: [...project.recipients, recipient] });
     setSingleInput('');
@@ -841,34 +1189,131 @@ function RecipientsTab({
     const newRecipients: Recipient[] = names.map((name, i) => ({
       id: generateId(),
       name,
-      certificateNumber: `CERT/${padNumber(startIdx + i + 1, 3)}/${new Date().getFullYear()}`,
+      customFields: {},
+      certificateNumber: generateCertNumber(cfg, startIdx + i),
     }));
     onSave({ ...project, recipients: [...project.recipients, ...newRecipients] });
     setBulkText('');
+    showToast(`${newRecipients.length} penerima berhasil ditambahkan`, 'success');
+  }
+
+  async function handleFileSelect(file: File) {
+    setImporting(true);
+    try {
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      const rows = ext === 'csv' ? await parseCSVFile(file) : await parseExcelFile(file);
+      if (!rows.length) {
+        showToast('Tidak ada data ditemukan di file', 'info');
+        return;
+      }
+      const extraColumns = rows.length > 0 ? Object.keys(rows[0].customFields) : [];
+      setImportPreview({ rows, nameColumn: 'Nama', extraColumns });
+    } catch {
+      showToast('Gagal membaca file. Pastikan format file benar.', 'info');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function confirmImport() {
+    if (!importPreview) return;
+    const startIdx = project.recipients.length;
+    const newRecipients: Recipient[] = importPreview.rows.map((row, i) => ({
+      id: generateId(),
+      name: row.name,
+      customFields: row.customFields,
+      certificateNumber: generateCertNumber(cfg, startIdx + i),
+    }));
+    onSave({ ...project, recipients: [...project.recipients, ...newRecipients] });
+    setImportPreview(null);
+    showToast(`${newRecipients.length} penerima berhasil diimport`, 'success');
   }
 
   function removeRecipient(id: string) {
-    onSave({
-      ...project,
-      recipients: project.recipients.filter((r) => r.id !== id),
+    const idx = project.recipients.findIndex((r) => r.id === id);
+    if (idx < 0) return;
+    const recipient = project.recipients[idx];
+    setLastDeleted({ recipient, index: idx });
+
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = setTimeout(() => setLastDeleted(null), 5000);
+
+    onSave({ ...project, recipients: project.recipients.filter((r) => r.id !== id) });
+    const savedRecipient = recipient;
+    const savedIdx = idx;
+    showToast(`Hapus "${recipient.name}"`, 'undo', () => {
+      // undo: re-insert at original position
+      const current = project.recipients.filter((r) => r.id !== id);
+      const restored = [...current];
+      restored.splice(savedIdx, 0, savedRecipient);
+      onSave({ ...project, recipients: restored });
+      setLastDeleted(null);
     });
   }
+
+  function deleteSelected() {
+    const count = selectedIds.size;
+    onSave({
+      ...project,
+      recipients: project.recipients.filter((r) => !selectedIds.has(r.id)),
+    });
+    setSelectedIds(new Set());
+    showToast(`${count} penerima dihapus`, 'success');
+  }
+
+  function toggleSelect(id: string) {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+  }
+
+  function toggleSelectAll(filtered: Recipient[]) {
+    if (filtered.every((r) => selectedIds.has(r.id))) {
+      const next = new Set(selectedIds);
+      filtered.forEach((r) => next.delete(r.id));
+      setSelectedIds(next);
+    } else {
+      const next = new Set(selectedIds);
+      filtered.forEach((r) => next.add(r.id));
+      setSelectedIds(next);
+    }
+  }
+
+  function handleExportCSV() {
+    const csv = exportRecipientsToCSV(project.recipients);
+    downloadText(csv, 'penerima.csv');
+  }
+
+  const filteredRecipients = searchQuery.trim()
+    ? project.recipients.filter((r) =>
+        r.name.toLowerCase().includes(searchQuery.toLowerCase())
+      )
+    : project.recipients;
 
   const bulkCount = bulkText
     .split('\n')
     .map((n) => n.trim())
     .filter(Boolean).length;
 
+  // Collect all extra column keys across all recipients
+  const extraKeys = Array.from(
+    new Set(project.recipients.flatMap((r) => Object.keys(r.customFields)))
+  );
+
+  const allFilteredSelected =
+    filteredRecipients.length > 0 &&
+    filteredRecipients.every((r) => selectedIds.has(r.id));
+
   return (
     <div className="space-y-5">
       {/* Input section */}
       <div className="bg-white rounded-2xl shadow-sm p-5 space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-2">
           <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
             <Users size={16} className="text-emerald-500" />
             Tambah Penerima
           </h2>
-          {/* Toggle */}
           <div className="flex bg-gray-100 rounded-xl p-1 gap-1">
             <button
               onClick={() => setBulkMode(false)}
@@ -895,10 +1340,7 @@ function RecipientsTab({
               value={singleInput}
               onChange={(e) => setSingleInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  addSingle();
-                }
+                if (e.key === 'Enter') { e.preventDefault(); addSingle(); }
               }}
             />
             <button
@@ -928,17 +1370,136 @@ function RecipientsTab({
             </button>
           </div>
         )}
+
+        {/* Excel/CSV import */}
+        <div className="border-t border-gray-100 pt-4 flex flex-wrap gap-2">
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing}
+            className="flex items-center gap-2 border border-emerald-300 text-emerald-600 hover:bg-emerald-50 text-xs font-medium px-3 py-2 rounded-xl transition disabled:opacity-50"
+          >
+            <Upload size={14} />
+            {importing ? 'Membaca...' : 'Import Excel / CSV'}
+          </button>
+          {project.recipients.length > 0 && (
+            <button
+              onClick={handleExportCSV}
+              className="flex items-center gap-2 border border-gray-200 text-gray-600 hover:bg-gray-50 text-xs font-medium px-3 py-2 rounded-xl transition"
+            >
+              <Download size={14} />
+              Export CSV
+            </button>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.csv"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleFileSelect(file);
+              e.target.value = '';
+            }}
+          />
+        </div>
       </div>
+
+      {/* Import preview modal */}
+      {importPreview && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="font-semibold text-gray-800">Konfirmasi Import</h3>
+              <button
+                onClick={() => setImportPreview(null)}
+                className="p-2 rounded-xl hover:bg-gray-100 text-gray-500 transition"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="p-5 space-y-3">
+              <p className="text-sm text-gray-700">
+                <span className="font-semibold text-emerald-600">{importPreview.rows.length} nama</span> ditemukan dari file.
+              </p>
+              <div className="text-xs text-gray-500">
+                Kolom nama: <span className="font-semibold text-gray-700">{importPreview.nameColumn}</span>
+              </div>
+              {importPreview.extraColumns.length > 0 && (
+                <div className="text-xs text-gray-500">
+                  Kolom tambahan:{' '}
+                  <span className="font-semibold text-gray-700">
+                    {importPreview.extraColumns.join(', ')}
+                  </span>
+                </div>
+              )}
+              {/* Preview first 5 */}
+              <div className="bg-gray-50 rounded-xl p-3 max-h-40 overflow-y-auto">
+                {importPreview.rows.slice(0, 5).map((r, i) => (
+                  <p key={i} className="text-xs text-gray-700 py-0.5">{i + 1}. {r.name}</p>
+                ))}
+                {importPreview.rows.length > 5 && (
+                  <p className="text-xs text-gray-400 mt-1">...dan {importPreview.rows.length - 5} lainnya</p>
+                )}
+              </div>
+            </div>
+            <div className="px-5 py-4 border-t border-gray-100 flex justify-end gap-3">
+              <button
+                onClick={() => setImportPreview(null)}
+                className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-xl transition"
+              >
+                Batal
+              </button>
+              <button
+                onClick={confirmImport}
+                className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium px-5 py-2 rounded-xl transition"
+              >
+                <Check size={15} strokeWidth={3} />
+                Import Sekarang
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Recipients table */}
       <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
-        <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-gray-700">
-            Daftar Penerima
-          </h2>
-          <span className="text-xs text-gray-400 bg-gray-100 px-2.5 py-1 rounded-full">
-            {project.recipients.length} orang
-          </span>
+        <div className="px-5 py-4 border-b border-gray-100 space-y-3">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h2 className="text-sm font-semibold text-gray-700">Daftar Penerima</h2>
+            <span className="text-xs text-gray-400 bg-gray-100 px-2.5 py-1 rounded-full">
+              {project.recipients.length} orang
+            </span>
+          </div>
+
+          {/* Search bar */}
+          {project.recipients.length > 0 && (
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <svg
+                  className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+                  width="14" height="14" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                >
+                  <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" />
+                </svg>
+                <input
+                  className="border border-gray-200 bg-gray-50 focus:bg-white rounded-xl pl-8 pr-4 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 w-full transition"
+                  placeholder="Cari nama penerima..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
+              {selectedIds.size > 0 && (
+                <button
+                  onClick={deleteSelected}
+                  className="flex items-center gap-1.5 bg-red-500 hover:bg-red-600 text-white text-xs font-medium px-3 py-2 rounded-xl transition"
+                >
+                  <Trash size={13} />
+                  Hapus {selectedIds.size} terpilih
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         {project.recipients.length === 0 ? (
@@ -947,39 +1508,75 @@ function RecipientsTab({
             <p className="text-sm font-medium text-gray-400">Belum ada penerima</p>
             <p className="text-xs text-gray-300">Tambahkan nama penerima di atas</p>
           </div>
+        ) : filteredRecipients.length === 0 ? (
+          <div className="py-12 flex flex-col items-center gap-2 text-gray-300">
+            <p className="text-sm font-medium text-gray-400">Tidak ada hasil untuk &ldquo;{searchQuery}&rdquo;</p>
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-gray-50 text-left">
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 w-12">No</th>
+                  <th className="px-4 py-3 w-10">
+                    <input
+                      type="checkbox"
+                      checked={allFilteredSelected}
+                      onChange={() => toggleSelectAll(filteredRecipients)}
+                      className="rounded accent-emerald-500"
+                    />
+                  </th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 w-10">No</th>
                   <th className="px-4 py-3 text-xs font-semibold text-gray-500">Nama</th>
                   <th className="px-4 py-3 text-xs font-semibold text-gray-500 hidden sm:table-cell">
                     No. Sertifikat
                   </th>
+                  {extraKeys.map((k) => (
+                    <th key={k} className="px-4 py-3 text-xs font-semibold text-gray-500 hidden md:table-cell">
+                      {k}
+                    </th>
+                  ))}
                   <th className="px-4 py-3 text-xs font-semibold text-gray-500 w-12 text-right">
                     Hapus
                   </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-50">
-                {project.recipients.map((r, i) => (
-                  <tr key={r.id} className="hover:bg-gray-50 transition">
-                    <td className="px-4 py-3 text-gray-400 text-xs">{i + 1}</td>
-                    <td className="px-4 py-3 text-gray-800 font-medium">{r.name}</td>
-                    <td className="px-4 py-3 text-gray-400 text-xs hidden sm:table-cell font-mono">
-                      {r.certificateNumber}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <button
-                        onClick={() => removeRecipient(r.id)}
-                        className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition"
-                      >
-                        <Trash size={14} />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {filteredRecipients.map((r, i) => {
+                  const globalIdx = project.recipients.indexOf(r);
+                  return (
+                    <tr
+                      key={r.id}
+                      className={`hover:bg-gray-50 transition ${selectedIds.has(r.id) ? 'bg-emerald-50' : ''}`}
+                    >
+                      <td className="px-4 py-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(r.id)}
+                          onChange={() => toggleSelect(r.id)}
+                          className="rounded accent-emerald-500"
+                        />
+                      </td>
+                      <td className="px-4 py-3 text-gray-400 text-xs">{globalIdx + 1}</td>
+                      <td className="px-4 py-3 text-gray-800 font-medium">{r.name}</td>
+                      <td className="px-4 py-3 text-gray-400 text-xs hidden sm:table-cell font-mono">
+                        {r.certificateNumber}
+                      </td>
+                      {extraKeys.map((k) => (
+                        <td key={k} className="px-4 py-3 text-gray-500 text-xs hidden md:table-cell">
+                          {r.customFields[k] ?? ''}
+                        </td>
+                      ))}
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          onClick={() => removeRecipient(r.id)}
+                          className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition"
+                        >
+                          <Trash size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1005,7 +1602,7 @@ function RecipientsTab({
   );
 }
 
-// ─── Tab 4: Preview ───────────────────────────────────────────────────────────
+// ─── Tab 5: Preview ───────────────────────────────────────────────────────────
 
 function PreviewTab({
   project,
@@ -1021,7 +1618,6 @@ function PreviewTab({
   const recipients = project.recipients;
   const hasRecipients = recipients.length > 0;
 
-  // Clamp index
   const safeIndex = hasRecipients
     ? Math.min(Math.max(previewIndex, 0), recipients.length - 1)
     : 0;
@@ -1060,7 +1656,6 @@ function PreviewTab({
             <ChevronLeft size={18} />
           </button>
 
-          {/* Dropdown selector */}
           <select
             value={safeIndex}
             onChange={(e) => setPreviewIndex(Number(e.target.value))}
@@ -1094,13 +1689,8 @@ function PreviewTab({
         </div>
       )}
 
-      {/* Certificate preview — fixed container sized to scaled certificate */}
+      {/* Certificate preview */}
       <div className="bg-gray-200 rounded-2xl overflow-auto flex items-start justify-center p-6">
-        {/* 
-          CertificateRenderer applies scale internally via transform.
-          transform doesn't affect layout, so we set explicit container size = 1122*scale × 794*scale
-          to avoid the certificate overflowing or appearing tiny.
-        */}
         <div style={{ width: 1122 * 0.6, height: 794 * 0.6, position: 'relative', flexShrink: 0 }}>
           <CertificateRenderer
             templateId={project.templateId}
