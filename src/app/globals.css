@@ -1,0 +1,80 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800;900&display=swap');
+
+* {
+  font-family: 'Poppins', sans-serif;
+}
+
+:root {
+  --green-primary: #10b981;
+  --green-light: #34d399;
+  --green-pale: #ecfdf5;
+  --green-border: #a7f3d0;
+}
+
+html { scroll-behavior: smooth; }
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: #f8fafc; }
+::-webkit-scrollbar-thumb { background: #a7f3d0; border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: #10b981; }
+
+/* ── Print styles ─────────────────────────────────────────────────────────── */
+@media print {
+  /* Hide everything except print area */
+  body * { visibility: hidden; }
+  .print-area, .print-area * { visibility: visible; }
+
+  /* Reset body for print */
+  body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: white !important;
+  }
+
+  /* Position print area to fill page */
+  .print-area {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    margin: 0;
+    padding: 0;
+  }
+
+  /* Each certificate page */
+  .certificate-page {
+    /* Override any transform — print at actual size */
+    transform: none !important;
+    transform-origin: unset !important;
+    /* Force exact A4 landscape dimensions */
+    width: 297mm !important;
+    height: 210mm !important;
+    /* Page break between certificates */
+    page-break-after: always;
+    break-after: page;
+    /* No margin/padding */
+    margin: 0 !important;
+    padding: 0 !important;
+    /* Ensure background colors print */
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+  }
+
+  /* Last certificate — no page break after */
+  .certificate-page:last-child {
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+
+  /* Hide UI elements */
+  .no-print { display: none !important; }
+}
+
+/* ── Page setup for print ─────────────────────────────────────────────────── */
+@page {
+  size: A4 landscape;
+  margin: 0;
+}
